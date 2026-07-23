@@ -100,6 +100,41 @@ public class TopologyAndRegistrationTests
     }
 
     [Fact]
+    public async Task BrokerDeadLetter_main_queue_deadletters_to_retry_queue_via_default_exchange()
+    {
+        var channel = Substitute.For<IChannel>();
+        var connection = Substitute.For<IRabbitMqConnection>();
+        connection
+            .CreateChannelAsync(Arg.Any<CreateChannelOptions?>(), Arg.Any<CancellationToken>())
+            .Returns(channel);
+
+        var registry = new RabbitMqTopologyRegistry();
+        registry.Consumers.Add(new RabbitMqConsumerOptions
+        {
+            Queue = "orders",
+            Exchange = "orders.ex",
+            RoutingKey = "order.created",
+            RetryQueue = "orders.retry",
+            RetryDelayMilliseconds = 5000,
+            RetryStrategy = RetryStrategy.BrokerDeadLetter,
+        });
+
+        var initializer = new RabbitMqTopologyInitializer(
+            connection,
+            registry,
+            NullLogger<RabbitMqTopologyInitializer>.Instance);
+
+        await initializer.StartAsync(CancellationToken.None);
+
+        var mainDeclare = QueueDeclareCalls(channel).Single(args => (string?)args[0] == "orders");
+        var arguments = Assert.IsAssignableFrom<IDictionary<string, object?>>(mainDeclare[4]!);
+
+        // On nack the broker must route the message to the retry queue via the default exchange.
+        Assert.Equal(string.Empty, arguments["x-dead-letter-exchange"]);
+        Assert.Equal("orders.retry", arguments["x-dead-letter-routing-key"]);
+    }
+
+    [Fact]
     public async Task AddRabbitMq_called_twice_shares_one_registry_and_single_initializer()
     {
         var services = new ServiceCollection();

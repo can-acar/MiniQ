@@ -208,7 +208,12 @@ public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundServ
         }
     }
 
-    private async Task HandleFailureAsync(IChannel channel, BasicDeliverEventArgs eventArgs, Exception ex)
+    private Task HandleFailureAsync(IChannel channel, BasicDeliverEventArgs eventArgs, Exception ex)
+        => _options.RetryStrategy == RetryStrategy.BrokerDeadLetter
+            ? HandleFailureViaBrokerAsync(channel, eventArgs, ex)
+            : HandleFailureViaRepublishAsync(channel, eventArgs, ex);
+
+    private async Task HandleFailureViaRepublishAsync(IChannel channel, BasicDeliverEventArgs eventArgs, Exception ex)
     {
         var retryCount = GetRetryCount(eventArgs.BasicProperties);
         var canRetry = _options.MaxRetries > 0
@@ -256,30 +261,77 @@ public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundServ
         await SafeNackAsync(channel, eventArgs.DeliveryTag, requeue: false).ConfigureAwait(false);
     }
 
+    private async Task HandleFailureViaBrokerAsync(IChannel channel, BasicDeliverEventArgs eventArgs, Exception ex)
+    {
+        // Count retries from the broker-maintained x-death header (how many times this queue rejected
+        // the message), so no consumer-side counter or republish is needed for the retry itself.
+        var retryCount = DeathHeaderReader.Count(eventArgs.BasicProperties.Headers, _options.Queue, "rejected");
+        var canRetry = _options.MaxRetries > 0
+            && retryCount < _options.MaxRetries
+            && _options.RetryDelayMilliseconds > 0
+            && !string.IsNullOrEmpty(_options.RetryQueue);
+
+        if (canRetry)
+        {
+            // Single atomic operation: the broker dead-letters the message to the retry queue. No
+            // republish, no dual-write, so this common failure path cannot duplicate the message.
+            await SafeNackAsync(channel, eventArgs.DeliveryTag, requeue: false).ConfigureAwait(false);
+
+            _logger.LogWarning(
+                ex,
+                "{MessageType} failed (retry {Attempt}/{Max}) on {Queue}; broker will redeliver via {RetryQueue} after {Delay}ms",
+                typeof(TMessage).Name,
+                retryCount + 1,
+                _options.MaxRetries,
+                _options.Queue,
+                _options.RetryQueue,
+                _options.RetryDelayMilliseconds);
+            return;
+        }
+
+        // Exhausted. nack would loop back into the retry queue, so route to the terminal dead-letter
+        // queue explicitly. This is the only publish on the failure path, and only for poison messages.
+        try
+        {
+            if (await TryForwardToDeadLetterAsync(eventArgs).ConfigureAwait(false))
+            {
+                _logger.LogError(
+                    ex,
+                    "{MessageType} exhausted {Max} retries on {Queue}; dead-lettered to {DeadLetterQueue}",
+                    typeof(TMessage).Name,
+                    _options.MaxRetries,
+                    _options.Queue,
+                    _options.DeadLetterQueue);
+            }
+            else
+            {
+                _logger.LogError(
+                    ex,
+                    "{MessageType} exhausted {Max} retries on {Queue} with no dead-letter queue configured; dropping",
+                    typeof(TMessage).Name,
+                    _options.MaxRetries,
+                    _options.Queue);
+            }
+
+            await SafeAckAsync(channel, eventArgs.DeliveryTag).ConfigureAwait(false);
+        }
+        catch (Exception dlqEx)
+        {
+            _logger.LogError(
+                dlqEx,
+                "Failed to dead-letter exhausted {MessageType} on {Queue}; requeueing",
+                typeof(TMessage).Name,
+                _options.Queue);
+
+            await SafeNackAsync(channel, eventArgs.DeliveryTag, requeue: true).ConfigureAwait(false);
+        }
+    }
+
     private async Task ForwardToRetryAsync(BasicDeliverEventArgs eventArgs, int nextRetryCount)
     {
         await using var pooled = await _pool.RentAsync(_stoppingToken).ConfigureAwait(false);
 
-        var headers = new Dictionary<string, object?>();
-        if (eventArgs.BasicProperties.Headers is not null)
-        {
-            foreach (var header in eventArgs.BasicProperties.Headers)
-            {
-                headers[header.Key] = header.Value;
-            }
-        }
-
-        headers[RetryCountHeader] = nextRetryCount;
-
-        var properties = new BasicProperties
-        {
-            Persistent = true,
-            ContentType = eventArgs.BasicProperties.ContentType,
-            MessageId = eventArgs.BasicProperties.MessageId,
-            CorrelationId = eventArgs.BasicProperties.CorrelationId,
-            Type = eventArgs.BasicProperties.Type,
-            Headers = headers
-        };
+        var properties = CloneProperties(eventArgs.BasicProperties, (RetryCountHeader, nextRetryCount));
 
         await pooled.Channel.BasicPublishAsync(
             exchange: string.Empty,
@@ -288,6 +340,67 @@ public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundServ
             basicProperties: properties,
             body: eventArgs.Body.ToArray(),
             cancellationToken: _stoppingToken).ConfigureAwait(false);
+    }
+
+    private async Task<bool> TryForwardToDeadLetterAsync(BasicDeliverEventArgs eventArgs)
+    {
+        string exchange;
+        string routingKey;
+        if (!string.IsNullOrEmpty(_options.DeadLetterExchange))
+        {
+            exchange = _options.DeadLetterExchange;
+            routingKey = _options.RoutingKey;
+        }
+        else if (!string.IsNullOrEmpty(_options.DeadLetterQueue))
+        {
+            exchange = string.Empty;
+            routingKey = _options.DeadLetterQueue;
+        }
+        else
+        {
+            return false;
+        }
+
+        await using var pooled = await _pool.RentAsync(_stoppingToken).ConfigureAwait(false);
+
+        var properties = CloneProperties(eventArgs.BasicProperties);
+
+        await pooled.Channel.BasicPublishAsync(
+            exchange,
+            routingKey,
+            mandatory: false,
+            basicProperties: properties,
+            body: eventArgs.Body.ToArray(),
+            cancellationToken: _stoppingToken).ConfigureAwait(false);
+
+        return true;
+    }
+
+    private static BasicProperties CloneProperties(IReadOnlyBasicProperties source, (string Key, object? Value)? extraHeader = null)
+    {
+        var headers = new Dictionary<string, object?>();
+        if (source.Headers is not null)
+        {
+            foreach (var header in source.Headers)
+            {
+                headers[header.Key] = header.Value;
+            }
+        }
+
+        if (extraHeader is { } extra)
+        {
+            headers[extra.Key] = extra.Value;
+        }
+
+        return new BasicProperties
+        {
+            Persistent = true,
+            ContentType = source.ContentType,
+            MessageId = source.MessageId,
+            CorrelationId = source.CorrelationId,
+            Type = source.Type,
+            Headers = headers
+        };
     }
 
     private static int GetRetryCount(IReadOnlyBasicProperties properties)

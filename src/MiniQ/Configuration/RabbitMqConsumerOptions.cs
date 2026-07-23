@@ -41,6 +41,13 @@ public sealed class RabbitMqConsumerOptions
     public string RetryQueue { get; set; } = string.Empty;
 
     /// <summary>
+    /// Selects how failed deliveries are retried. Defaults to <see cref="MiniQ.RetryStrategy.Republish"/>;
+    /// <see cref="MiniQ.RetryStrategy.BrokerDeadLetter"/> removes the consumer-side republish (no dual-write)
+    /// at the cost of a fixed retry delay and broker-driven topology.
+    /// </summary>
+    public RetryStrategy RetryStrategy { get; set; } = RetryStrategy.Republish;
+
+    /// <summary>
     /// When <c>true</c>, deliveries to this consumer are de-duplicated via the registered
     /// <see cref="IIdempotencyStore"/>, keyed on the AMQP <c>MessageId</c>. Best-effort — see
     /// <see cref="IIdempotencyStore"/> for the exact guarantee.

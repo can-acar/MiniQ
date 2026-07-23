@@ -53,6 +53,11 @@ public sealed class RabbitMqTopologyInitializer : IHostedService
     {
         var arguments = new Dictionary<string, object?>();
 
+        var hasBrokerRetry = options.RetryStrategy == RetryStrategy.BrokerDeadLetter
+            && options.RetryDelayMilliseconds > 0
+            && !string.IsNullOrEmpty(options.RetryQueue);
+
+        // Terminal dead-letter infrastructure for poison messages (both strategies).
         if (!string.IsNullOrEmpty(options.DeadLetterExchange))
         {
             await channel.ExchangeDeclareAsync(
@@ -61,23 +66,37 @@ public sealed class RabbitMqTopologyInitializer : IHostedService
                 durable: true,
                 autoDelete: false,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
 
-            if (!string.IsNullOrEmpty(options.DeadLetterQueue))
+        if (!string.IsNullOrEmpty(options.DeadLetterQueue))
+        {
+            await channel.QueueDeclareAsync(
+                options.DeadLetterQueue,
+                durable: true,
+                exclusive: false,
+                autoDelete: false,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            if (!string.IsNullOrEmpty(options.DeadLetterExchange))
             {
-                await channel.QueueDeclareAsync(
-                    options.DeadLetterQueue,
-                    durable: true,
-                    exclusive: false,
-                    autoDelete: false,
-                    cancellationToken: cancellationToken).ConfigureAwait(false);
-
                 await channel.QueueBindAsync(
                     options.DeadLetterQueue,
                     options.DeadLetterExchange,
                     options.RoutingKey,
                     cancellationToken: cancellationToken).ConfigureAwait(false);
             }
+        }
 
+        // Wire the main queue's dead-letter destination based on the retry strategy.
+        if (hasBrokerRetry)
+        {
+            // BrokerDeadLetter: a nack routes the message to the retry queue via the default exchange.
+            arguments["x-dead-letter-exchange"] = string.Empty;
+            arguments["x-dead-letter-routing-key"] = options.RetryQueue;
+        }
+        else if (!string.IsNullOrEmpty(options.DeadLetterExchange))
+        {
+            // Republish (or broker without a retry queue): a nack dead-letters straight to the terminal exchange.
             arguments["x-dead-letter-exchange"] = options.DeadLetterExchange;
             arguments["x-dead-letter-routing-key"] = options.RoutingKey;
         }

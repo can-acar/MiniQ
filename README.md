@@ -146,6 +146,30 @@ The store is resolved from the **same DI scope as the handler**, which is what m
 - `InMemoryIdempotencyStore` exists for **development and tests only**: it is not durable, not shared across instances, and grows unbounded. Never use it in production.
 - The pre-check + mark are two operations, so this is a best-effort filter, not a lock. Only a store that writes the id transactionally with the handler's own work closes the window completely.
 
+### Retry strategies
+
+A failed handler retries via one of two strategies, set per consumer with `RetryStrategy`:
+
+| | `Republish` (default) | `BrokerDeadLetter` |
+| --- | --- | --- |
+| How | Consumer republishes to the retry queue, then acks the original | Consumer `nack`s; the broker dead-letters to the retry queue |
+| Atomicity | Two steps — a crash between them can duplicate the message | One atomic `nack` on the common failure path — no dual-write |
+| Retry count | `x-retry-count` header the consumer increments | Broker's `x-death` header |
+| Exhaustion | `nack(requeue: false)` → dead-letter queue | Explicit publish to the dead-letter queue (rare, poison-only) |
+
+```csharp
+rabbit.AddConsumer<OrderCreated, OrderCreatedHandler>("orders", c =>
+{
+    c.Queue = "sample.orders";
+    c.RetryStrategy = RetryStrategy.BrokerDeadLetter;
+    c.DeadLetterQueue = "sample.orders.dlq";   // where exhausted messages land
+    c.MaxRetries = 3;
+    c.RetryDelayMilliseconds = 5000;
+});
+```
+
+`BrokerDeadLetter` removes the republish dual-write on the hot failure path; the only remaining publish is the rare exhausted-to-DLQ step. Both strategies use a fixed retry delay. If no dead-letter queue is configured, exhausted messages are dropped (a `nack` would loop back into the retry queue).
+
 ## Building from source
 
 ```bash
