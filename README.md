@@ -126,6 +126,26 @@ At startup, `RabbitMqTopologyInitializer` (an `IHostedService`) declares every r
 
 MiniQ is **at-least-once**. Retries and the non-atomic *forward-to-retry-then-ack* step can deliver a message more than once, and publisher confirms prove broker receipt — not routing or exactly-once processing. **Make your handlers idempotent.** Set `RabbitMqPublisherOptions.Mandatory = true` if you need unroutable messages surfaced rather than dropped.
 
+### Effectively-once (idempotent consumers)
+
+Exactly-once *delivery* is impossible; effectively-once *processing* only exists at the sink. MiniQ gives you the seam, not a magic guarantee. Mark a consumer `Idempotent` and register an `IIdempotencyStore`; each delivery is then checked (keyed on `MessageId`) before dispatch and recorded after success:
+
+```csharp
+rabbit.UseIdempotencyStore<SqlInboxStore>();   // scoped by default
+
+rabbit.AddConsumer<OrderCreated, OrderCreatedHandler>("orders", c =>
+{
+    c.Queue = "sample.orders";
+    c.Idempotent = true;
+});
+```
+
+The store is resolved from the **same DI scope as the handler**, which is what makes the correct implementation possible — the **transactional inbox pattern**: your store records the processed `MessageId` in the *same database transaction* as the handler's business writes. Then a partial failure can never leave the side effect committed but the id unrecorded (or vice versa).
+
+- `NoOpIdempotencyStore` is the default — no de-duplication, plain at-least-once.
+- `InMemoryIdempotencyStore` exists for **development and tests only**: it is not durable, not shared across instances, and grows unbounded. Never use it in production.
+- The pre-check + mark are two operations, so this is a best-effort filter, not a lock. Only a store that writes the id transactionally with the handler's own work closes the window completely.
+
 ## Building from source
 
 ```bash

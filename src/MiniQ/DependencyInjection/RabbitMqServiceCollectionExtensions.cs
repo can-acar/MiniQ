@@ -26,6 +26,14 @@ public interface IRabbitMqBuilder
 
     IRabbitMqBuilder AddPublisher<TMessage>(string endpoint, Action<RabbitMqPublisherOptions>? configure = null)
         where TMessage : notnull;
+
+    /// <summary>
+    /// Registers the <see cref="IIdempotencyStore"/> used by consumers marked
+    /// <see cref="RabbitMqConsumerOptions.Idempotent"/>. Defaults to scoped so a DbContext-backed
+    /// inbox can share the handler's scope.
+    /// </summary>
+    IRabbitMqBuilder UseIdempotencyStore<TStore>(ServiceLifetime lifetime = ServiceLifetime.Scoped)
+        where TStore : class, IIdempotencyStore;
 }
 
 internal sealed class RabbitMqBuilder : IRabbitMqBuilder
@@ -87,6 +95,14 @@ internal sealed class RabbitMqBuilder : IRabbitMqBuilder
         configure?.Invoke(options);
         ApplyEndpoint(options, target);
         return RegisterPublisher<TMessage>(options);
+    }
+
+    public IRabbitMqBuilder UseIdempotencyStore<TStore>(ServiceLifetime lifetime = ServiceLifetime.Scoped)
+        where TStore : class, IIdempotencyStore
+    {
+        // Replace the default NoOp registration so the application's store wins regardless of lifetime.
+        Services.Replace(ServiceDescriptor.Describe(typeof(IIdempotencyStore), typeof(TStore), lifetime));
+        return this;
     }
 
     private IRabbitMqBuilder RegisterConsumer<TMessage, THandler>(RabbitMqConsumerOptions options)
@@ -166,6 +182,7 @@ public static class RabbitMqServiceCollectionExtensions
                 channelOptions);
         });
         services.TryAddSingleton<IRabbitMqSender, RabbitMqSender>();
+        services.TryAddSingleton<IIdempotencyStore, NoOpIdempotencyStore>();
 
         // The registry must be a single shared instance: calling AddRabbitMq more than once
         // (e.g. from independent modules) has to append to the same topology, otherwise the

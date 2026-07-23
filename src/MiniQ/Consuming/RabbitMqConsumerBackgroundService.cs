@@ -157,8 +157,30 @@ public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundServ
         try
         {
             using var scope = _scopeFactory.CreateScope();
-            var handler = scope.ServiceProvider.GetRequiredService<IMessageHandler<TMessage>>();
+            var provider = scope.ServiceProvider;
+
+            var messageId = eventArgs.BasicProperties.MessageId;
+            // Resolve the store from the handler's scope so a DbContext-backed inbox shares its scope.
+            var store = _options.Idempotent && !string.IsNullOrEmpty(messageId)
+                ? provider.GetRequiredService<IIdempotencyStore>()
+                : null;
+
+            if (store is not null
+                && await store.HasProcessedAsync(messageId!, _stoppingToken).ConfigureAwait(false))
+            {
+                _logger.LogDebug(
+                    "Skipping already-processed message {MessageId} on {Queue}", messageId, _options.Queue);
+                await SafeAckAsync(channel, eventArgs.DeliveryTag).ConfigureAwait(false);
+                return;
+            }
+
+            var handler = provider.GetRequiredService<IMessageHandler<TMessage>>();
             await handler.HandleAsync(message, _stoppingToken).ConfigureAwait(false);
+
+            if (store is not null)
+            {
+                await SafeMarkProcessedAsync(store, messageId!).ConfigureAwait(false);
+            }
 
             await SafeAckAsync(channel, eventArgs.DeliveryTag).ConfigureAwait(false);
         }
@@ -169,6 +191,20 @@ public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundServ
         catch (Exception ex)
         {
             await HandleFailureAsync(channel, eventArgs, ex).ConfigureAwait(false);
+        }
+    }
+
+    private async Task SafeMarkProcessedAsync(IIdempotencyStore store, string messageId)
+    {
+        try
+        {
+            await store.MarkProcessedAsync(messageId, _stoppingToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // The handler already succeeded; failing to record the id only risks a future redelivery
+            // being reprocessed. Degrade to at-least-once rather than fail the (successful) message.
+            _logger.LogWarning(ex, "Failed to record idempotency key {MessageId} on {Queue}", messageId, _options.Queue);
         }
     }
 

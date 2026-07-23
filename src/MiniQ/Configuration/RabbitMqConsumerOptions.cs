@@ -39,4 +39,11 @@ public sealed class RabbitMqConsumerOptions
 
     /// <summary>Delayed retry queue name. Defaults to <c>{Queue}.retry</c> when a retry delay is configured.</summary>
     public string RetryQueue { get; set; } = string.Empty;
+
+    /// <summary>
+    /// When <c>true</c>, deliveries to this consumer are de-duplicated via the registered
+    /// <see cref="IIdempotencyStore"/>, keyed on the AMQP <c>MessageId</c>. Best-effort — see
+    /// <see cref="IIdempotencyStore"/> for the exact guarantee.
+    /// </summary>
+    public bool Idempotent { get; set; }
 }
