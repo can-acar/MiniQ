@@ -35,5 +35,6 @@ public sealed class RabbitMqTypedPublisher<TMessage> : IRabbitMqPublisher<TMessa
             message,
             _messageType,
             correlationId,
+            _options.Mandatory,
             cancellationToken);
 }

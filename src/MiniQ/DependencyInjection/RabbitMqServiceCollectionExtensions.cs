@@ -167,13 +167,33 @@ public static class RabbitMqServiceCollectionExtensions
         });
         services.TryAddSingleton<IRabbitMqSender, RabbitMqSender>();
 
-        var registry = new RabbitMqTopologyRegistry();
-        services.AddSingleton(registry);
+        // The registry must be a single shared instance: calling AddRabbitMq more than once
+        // (e.g. from independent modules) has to append to the same topology, otherwise the
+        // topology initializer would resolve only the last registry and silently skip the
+        // consumers registered by earlier calls. AddHostedService already de-duplicates the
+        // initializer via TryAddEnumerable.
+        var registry = GetOrAddRegistry(services);
         services.AddHostedService<RabbitMqTopologyInitializer>();
 
         var builder = new RabbitMqBuilder(services, registry);
         configure(builder);
 
         return services;
+    }
+
+    private static RabbitMqTopologyRegistry GetOrAddRegistry(IServiceCollection services)
+    {
+        foreach (var descriptor in services)
+        {
+            if (descriptor.ServiceType == typeof(RabbitMqTopologyRegistry)
+                && descriptor.ImplementationInstance is RabbitMqTopologyRegistry existing)
+            {
+                return existing;
+            }
+        }
+
+        var registry = new RabbitMqTopologyRegistry();
+        services.AddSingleton(registry);
+        return registry;
     }
 }

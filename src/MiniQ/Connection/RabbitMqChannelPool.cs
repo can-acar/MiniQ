@@ -24,7 +24,7 @@ public sealed class RabbitMqChannelPool : IAsyncDisposable
 
     public async Task<PooledChannel> RentAsync(CancellationToken cancellationToken = default)
     {
-        await _limit.WaitAsync(cancellationToken);
+        await _limit.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             while (_channels.TryTake(out var pooled))
@@ -34,10 +34,10 @@ public sealed class RabbitMqChannelPool : IAsyncDisposable
                     return new PooledChannel(this, pooled);
                 }
 
-                await SafeDisposeAsync(pooled);
+                await SafeDisposeAsync(pooled).ConfigureAwait(false);
             }
 
-            var created = await _connection.CreateChannelAsync(_channelOptions, cancellationToken);
+            var created = await _connection.CreateChannelAsync(_channelOptions, cancellationToken).ConfigureAwait(false);
             return new PooledChannel(this, created);
         }
         catch
@@ -55,12 +55,12 @@ public sealed class RabbitMqChannelPool : IAsyncDisposable
 
             if (Volatile.Read(ref _disposed) != 0 && _channels.TryTake(out var drained))
             {
-                await SafeDisposeAsync(drained);
+                await SafeDisposeAsync(drained).ConfigureAwait(false);
             }
         }
         else
         {
-            await SafeDisposeAsync(channel);
+            await SafeDisposeAsync(channel).ConfigureAwait(false);
         }
 
         try
@@ -76,7 +76,7 @@ public sealed class RabbitMqChannelPool : IAsyncDisposable
     {
         try
         {
-            await channel.DisposeAsync();
+            await channel.DisposeAsync().ConfigureAwait(false);
         }
         catch
         {
@@ -92,7 +92,7 @@ public sealed class RabbitMqChannelPool : IAsyncDisposable
 
         while (_channels.TryTake(out var channel))
         {
-            await SafeDisposeAsync(channel);
+            await SafeDisposeAsync(channel).ConfigureAwait(false);
         }
 
         _limit.Dispose();

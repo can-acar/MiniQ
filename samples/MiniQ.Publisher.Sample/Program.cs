@@ -29,6 +29,11 @@ builder.Services.AddRabbitMq(rabbit =>
         publisher.Exchange = "sample.orders";
         publisher.RoutingKey = "order.created";
         publisher.DeclareExchange = true;
+
+        // Publisher confirms prove the broker received the message, not that it routed to a queue.
+        // With no consumer bound here, Mandatory = true makes unroutable messages observable
+        // (returned by the broker) instead of silently discarded.
+        publisher.Mandatory = true;
     });
 });
 

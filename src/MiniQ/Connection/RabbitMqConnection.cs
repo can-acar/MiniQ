@@ -38,7 +38,7 @@ public sealed class RabbitMqConnection : IRabbitMqConnection
             return open;
         }
 
-        await _gate.WaitAsync(cancellationToken);
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             if (_connection is { IsOpen: true } current)
@@ -48,11 +48,11 @@ public sealed class RabbitMqConnection : IRabbitMqConnection
 
             if (_connection is not null)
             {
-                await SafeDisposeAsync(_connection);
+                await SafeDisposeAsync(_connection).ConfigureAwait(false);
                 _connection = null;
             }
 
-            _connection = await CreateConnectionAsync(cancellationToken);
+            _connection = await CreateConnectionAsync(cancellationToken).ConfigureAwait(false);
             return _connection;
         }
         finally
@@ -63,8 +63,8 @@ public sealed class RabbitMqConnection : IRabbitMqConnection
 
     public async Task<IChannel> CreateChannelAsync(CreateChannelOptions? options = null, CancellationToken cancellationToken = default)
     {
-        var connection = await GetConnectionAsync(cancellationToken);
-        return await connection.CreateChannelAsync(options, cancellationToken);
+        var connection = await GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+        return await connection.CreateChannelAsync(options, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<IConnection> CreateConnectionAsync(CancellationToken cancellationToken)
@@ -95,10 +95,10 @@ public sealed class RabbitMqConnection : IRabbitMqConnection
 
         var endpoints = BuildEndpoints();
         var connection = endpoints.Count > 0
-            ? await factory.CreateConnectionAsync(endpoints, _options.ClientName, cancellationToken)
-            : await factory.CreateConnectionAsync(cancellationToken);
+            ? await factory.CreateConnectionAsync(endpoints, _options.ClientName, cancellationToken).ConfigureAwait(false)
+            : await factory.CreateConnectionAsync(cancellationToken).ConfigureAwait(false);
 
-        _logger.LogInformation("RabbitMQ connection established ({Endpoint})", _options.Uri);
+        _logger.LogInformation("RabbitMQ connection established ({Endpoint})", DescribeEndpoint());
         return connection;
     }
 
@@ -118,11 +118,30 @@ public sealed class RabbitMqConnection : IRabbitMqConnection
         return endpoints;
     }
 
+    /// <summary>
+    /// Builds a log-safe endpoint label. The configured URI may embed credentials
+    /// (<c>amqp://user:pass@host</c>), which must never be written to logs.
+    /// </summary>
+    private string DescribeEndpoint()
+    {
+        try
+        {
+            var uri = new Uri(_options.Uri);
+            var port = uri.Port > 0 ? uri.Port : 5672;
+            var vhost = string.IsNullOrWhiteSpace(_options.VirtualHost) ? "/" : _options.VirtualHost;
+            return $"{uri.Scheme}://{uri.Host}:{port}{(vhost.StartsWith('/') ? vhost : "/" + vhost)}";
+        }
+        catch (UriFormatException)
+        {
+            return "(unparseable uri)";
+        }
+    }
+
     private async ValueTask SafeDisposeAsync(IConnection connection)
     {
         try
         {
-            await connection.DisposeAsync();
+            await connection.DisposeAsync().ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -141,7 +160,7 @@ public sealed class RabbitMqConnection : IRabbitMqConnection
 
         if (_connection is not null)
         {
-            await SafeDisposeAsync(_connection);
+            await SafeDisposeAsync(_connection).ConfigureAwait(false);
             _connection = null;
         }
 

@@ -13,6 +13,7 @@ public interface IRabbitMqSender
         object message,
         string messageType,
         string? correlationId,
+        bool mandatory = false,
         CancellationToken cancellationToken = default);
 }
 
@@ -20,6 +21,10 @@ public interface IRabbitMqSender
 /// Low-level JSON publisher. Serializes the payload once, then publishes it over a pooled channel
 /// with persistent delivery and exponential retry backoff on transient failures.
 /// </summary>
+/// <remarks>
+/// Publisher confirms (enabled on the pooled channels) guarantee the broker <i>received</i> the message,
+/// not that it was routed to a queue. Retries make delivery at-least-once, so consumers must be idempotent.
+/// </remarks>
 public sealed class RabbitMqSender : IRabbitMqSender
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -44,6 +49,7 @@ public sealed class RabbitMqSender : IRabbitMqSender
         object message,
         string messageType,
         string? correlationId,
+        bool mandatory = false,
         CancellationToken cancellationToken = default)
     {
         var messageId = string.IsNullOrEmpty(correlationId) ? Guid.NewGuid().ToString("N") : correlationId;
@@ -53,7 +59,7 @@ public sealed class RabbitMqSender : IRabbitMqSender
         {
             try
             {
-                await using var pooled = await _pool.RentAsync(cancellationToken);
+                await using var pooled = await _pool.RentAsync(cancellationToken).ConfigureAwait(false);
 
                 var properties = new BasicProperties
                 {
@@ -66,16 +72,15 @@ public sealed class RabbitMqSender : IRabbitMqSender
                 if (!string.IsNullOrEmpty(correlationId))
                 {
                     properties.CorrelationId = correlationId;
-                    properties.Headers = new Dictionary<string, object?> { ["x-idempotency-key"] = correlationId };
                 }
 
                 await pooled.Channel.BasicPublishAsync(
                     exchange,
                     routingKey,
-                    mandatory: false,
+                    mandatory: mandatory,
                     basicProperties: properties,
                     body: body,
-                    cancellationToken: cancellationToken);
+                    cancellationToken: cancellationToken).ConfigureAwait(false);
 
                 return;
             }
@@ -83,7 +88,7 @@ public sealed class RabbitMqSender : IRabbitMqSender
             {
                 var delay = TimeSpan.FromMilliseconds(_options.RetryBaseDelayMilliseconds * Math.Pow(2, attempt - 1));
                 _logger.LogWarning(ex, "Publish to {Exchange} attempt {Attempt} failed, retrying in {Delay}", exchange, attempt, delay);
-                await Task.Delay(delay, cancellationToken);
+                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
             }
         }
     }

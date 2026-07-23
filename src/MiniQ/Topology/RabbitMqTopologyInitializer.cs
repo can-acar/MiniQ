@@ -26,11 +26,11 @@ public sealed class RabbitMqTopologyInitializer : IHostedService
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
-        await using var channel = await _connection.CreateChannelAsync(cancellationToken: cancellationToken);
+        await using var channel = await _connection.CreateChannelAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
 
         foreach (var consumer in _registry.Consumers)
         {
-            await DeclareConsumerAsync(channel, consumer, cancellationToken);
+            await DeclareConsumerAsync(channel, consumer, cancellationToken).ConfigureAwait(false);
         }
 
         foreach (var publisher in _registry.Publishers)
@@ -42,7 +42,7 @@ public sealed class RabbitMqTopologyInitializer : IHostedService
                     publisher.ExchangeType,
                     durable: true,
                     autoDelete: false,
-                    cancellationToken: cancellationToken);
+                    cancellationToken: cancellationToken).ConfigureAwait(false);
             }
         }
     }
@@ -60,7 +60,7 @@ public sealed class RabbitMqTopologyInitializer : IHostedService
                 ExchangeType.Direct,
                 durable: true,
                 autoDelete: false,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ConfigureAwait(false);
 
             if (!string.IsNullOrEmpty(options.DeadLetterQueue))
             {
@@ -69,13 +69,13 @@ public sealed class RabbitMqTopologyInitializer : IHostedService
                     durable: true,
                     exclusive: false,
                     autoDelete: false,
-                    cancellationToken: cancellationToken);
+                    cancellationToken: cancellationToken).ConfigureAwait(false);
 
                 await channel.QueueBindAsync(
                     options.DeadLetterQueue,
                     options.DeadLetterExchange,
                     options.RoutingKey,
-                    cancellationToken: cancellationToken);
+                    cancellationToken: cancellationToken).ConfigureAwait(false);
             }
 
             arguments["x-dead-letter-exchange"] = options.DeadLetterExchange;
@@ -99,7 +99,7 @@ public sealed class RabbitMqTopologyInitializer : IHostedService
                 options.ExchangeType,
                 durable: true,
                 autoDelete: false,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ConfigureAwait(false);
         }
 
         await channel.QueueDeclareAsync(
@@ -108,7 +108,7 @@ public sealed class RabbitMqTopologyInitializer : IHostedService
             exclusive: false,
             autoDelete: false,
             arguments: arguments.Count > 0 ? arguments : null,
-            cancellationToken: cancellationToken);
+            cancellationToken: cancellationToken).ConfigureAwait(false);
 
         if (!string.IsNullOrEmpty(options.Exchange))
         {
@@ -116,16 +116,23 @@ public sealed class RabbitMqTopologyInitializer : IHostedService
                 options.Queue,
                 options.Exchange,
                 options.RoutingKey,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ConfigureAwait(false);
         }
 
         if (options.RetryDelayMilliseconds > 0 && !string.IsNullOrEmpty(options.RetryQueue))
         {
+            // When no exchange is configured the main queue is only reachable through the default
+            // exchange, whose routing key is the queue name. Dead-lettering with the (empty) routing
+            // key would silently drop the message, so fall back to the queue name in that case.
+            var retryDeadLetterRoutingKey = string.IsNullOrEmpty(options.Exchange)
+                ? options.Queue
+                : options.RoutingKey;
+
             var retryArguments = new Dictionary<string, object?>
             {
                 ["x-message-ttl"] = options.RetryDelayMilliseconds,
                 ["x-dead-letter-exchange"] = options.Exchange,
-                ["x-dead-letter-routing-key"] = options.RoutingKey
+                ["x-dead-letter-routing-key"] = retryDeadLetterRoutingKey
             };
 
             await channel.QueueDeclareAsync(
@@ -134,7 +141,7 @@ public sealed class RabbitMqTopologyInitializer : IHostedService
                 exclusive: false,
                 autoDelete: false,
                 arguments: retryArguments,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ConfigureAwait(false);
         }
 
         _logger.LogInformation(

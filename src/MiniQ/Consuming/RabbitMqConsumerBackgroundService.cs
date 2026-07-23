@@ -12,10 +12,16 @@ namespace MiniQ;
 /// <see cref="IMessageHandler{TMessage}"/> in a scoped context, and drives ack / delayed-retry /
 /// dead-letter based on the handler outcome and <see cref="RabbitMqConsumerOptions"/>.
 /// </summary>
+/// <remarks>
+/// Delivery is <b>at-least-once</b>: on failure the message is forwarded to a delayed-retry queue and
+/// the original acknowledged in two non-atomic steps, and publisher confirms guarantee broker receipt
+/// but not exactly-once processing. Handlers must therefore be idempotent.
+/// </remarks>
 public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundService
     where TMessage : class
 {
     private const string RetryCountHeader = "x-retry-count";
+    private static readonly TimeSpan ChannelHealthInterval = TimeSpan.FromSeconds(15);
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
@@ -45,38 +51,87 @@ public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundServ
     {
         _stoppingToken = stoppingToken;
 
-        _channel = await _connection.CreateChannelAsync(
+        await StartConsumingAsync(stoppingToken).ConfigureAwait(false);
+
+        // The RabbitMQ client recovers connections and channels automatically, but recovery can fail
+        // permanently (revoked credentials, deleted vhost, broker-side channel close). A hosted service
+        // sitting on Task.Delay(Infinite) would then appear healthy while consuming nothing. Poll the
+        // channel and re-establish the subscription so the consumer never dies silently.
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(ChannelHealthInterval, stoppingToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            if (_channel is { IsOpen: true })
+            {
+                continue;
+            }
+
+            _logger.LogError(
+                "Consumer channel for {Queue} ({MessageType}) is not open; re-establishing subscription",
+                _options.Queue,
+                typeof(TMessage).Name);
+
+            try
+            {
+                await StartConsumingAsync(stoppingToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to re-establish consumer for {Queue}; will retry", _options.Queue);
+            }
+        }
+    }
+
+    private async Task StartConsumingAsync(CancellationToken cancellationToken)
+    {
+        var stale = _channel;
+        if (stale is not null)
+        {
+            try
+            {
+                await stale.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Error disposing stale consumer channel for {Queue}", _options.Queue);
+            }
+        }
+
+        var channel = await _connection.CreateChannelAsync(
             new CreateChannelOptions(
                 publisherConfirmationsEnabled: false,
                 publisherConfirmationTrackingEnabled: false,
                 consumerDispatchConcurrency: _options.DispatchConcurrency),
-            stoppingToken);
-        await _channel.BasicQosAsync(0, _options.PrefetchCount, false, stoppingToken);
+            cancellationToken).ConfigureAwait(false);
 
-        var consumer = new AsyncEventingBasicConsumer(_channel);
+        await channel.BasicQosAsync(0, _options.PrefetchCount, false, cancellationToken).ConfigureAwait(false);
+
+        var consumer = new AsyncEventingBasicConsumer(channel);
         consumer.ReceivedAsync += OnReceivedAsync;
 
-        await _channel.BasicConsumeAsync(
+        await channel.BasicConsumeAsync(
             _options.Queue,
             autoAck: false,
             consumer: consumer,
-            cancellationToken: stoppingToken);
+            cancellationToken: cancellationToken).ConfigureAwait(false);
 
+        _channel = channel;
         _logger.LogInformation("Consuming queue {Queue} for {MessageType}", _options.Queue, typeof(TMessage).Name);
-
-        try
-        {
-            await Task.Delay(Timeout.Infinite, stoppingToken);
-        }
-        catch (OperationCanceledException)
-        {
-        }
     }
 
     private async Task OnReceivedAsync(object sender, BasicDeliverEventArgs eventArgs)
     {
-        var channel = _channel;
-        if (channel is null)
+        // Acknowledge on the exact channel this delivery arrived on, not the current field value,
+        // which may already point at a re-established channel with unrelated delivery tags.
+        var channel = (sender as AsyncEventingBasicConsumer)?.Channel ?? _channel;
+        if (channel is null || !channel.IsOpen)
         {
             return;
         }
@@ -89,13 +144,13 @@ public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundServ
         catch (Exception ex)
         {
             _logger.LogError(ex, "Malformed message on {Queue}, dead-lettering", _options.Queue);
-            await SafeNackAsync(channel, eventArgs.DeliveryTag, requeue: false);
+            await SafeNackAsync(channel, eventArgs.DeliveryTag, requeue: false).ConfigureAwait(false);
             return;
         }
 
         if (message is null)
         {
-            await SafeNackAsync(channel, eventArgs.DeliveryTag, requeue: false);
+            await SafeNackAsync(channel, eventArgs.DeliveryTag, requeue: false).ConfigureAwait(false);
             return;
         }
 
@@ -103,17 +158,17 @@ public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundServ
         {
             using var scope = _scopeFactory.CreateScope();
             var handler = scope.ServiceProvider.GetRequiredService<IMessageHandler<TMessage>>();
-            await handler.HandleAsync(message, _stoppingToken);
+            await handler.HandleAsync(message, _stoppingToken).ConfigureAwait(false);
 
-            await SafeAckAsync(channel, eventArgs.DeliveryTag);
+            await SafeAckAsync(channel, eventArgs.DeliveryTag).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (_stoppingToken.IsCancellationRequested)
         {
-            await SafeNackAsync(channel, eventArgs.DeliveryTag, requeue: true);
+            await SafeNackAsync(channel, eventArgs.DeliveryTag, requeue: true).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            await HandleFailureAsync(channel, eventArgs, ex);
+            await HandleFailureAsync(channel, eventArgs, ex).ConfigureAwait(false);
         }
     }
 
@@ -129,8 +184,8 @@ public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundServ
         {
             try
             {
-                await ForwardToRetryAsync(eventArgs, retryCount + 1);
-                await SafeAckAsync(channel, eventArgs.DeliveryTag);
+                await ForwardToRetryAsync(eventArgs, retryCount + 1).ConfigureAwait(false);
+                await SafeAckAsync(channel, eventArgs.DeliveryTag).ConfigureAwait(false);
 
                 _logger.LogWarning(
                     ex,
@@ -150,7 +205,7 @@ public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundServ
                     typeof(TMessage).Name,
                     _options.Queue);
 
-                await SafeNackAsync(channel, eventArgs.DeliveryTag, requeue: true);
+                await SafeNackAsync(channel, eventArgs.DeliveryTag, requeue: true).ConfigureAwait(false);
                 return;
             }
         }
@@ -162,12 +217,12 @@ public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundServ
             retryCount + 1,
             _options.Queue);
 
-        await SafeNackAsync(channel, eventArgs.DeliveryTag, requeue: false);
+        await SafeNackAsync(channel, eventArgs.DeliveryTag, requeue: false).ConfigureAwait(false);
     }
 
     private async Task ForwardToRetryAsync(BasicDeliverEventArgs eventArgs, int nextRetryCount)
     {
-        await using var pooled = await _pool.RentAsync(_stoppingToken);
+        await using var pooled = await _pool.RentAsync(_stoppingToken).ConfigureAwait(false);
 
         var headers = new Dictionary<string, object?>();
         if (eventArgs.BasicProperties.Headers is not null)
@@ -196,7 +251,7 @@ public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundServ
             mandatory: false,
             basicProperties: properties,
             body: eventArgs.Body.ToArray(),
-            cancellationToken: _stoppingToken);
+            cancellationToken: _stoppingToken).ConfigureAwait(false);
     }
 
     private static int GetRetryCount(IReadOnlyBasicProperties properties)
@@ -222,7 +277,7 @@ public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundServ
     {
         try
         {
-            await channel.BasicAckAsync(deliveryTag, multiple: false);
+            await channel.BasicAckAsync(deliveryTag, multiple: false).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -238,7 +293,7 @@ public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundServ
     {
         try
         {
-            await channel.BasicNackAsync(deliveryTag, multiple: false, requeue: requeue);
+            await channel.BasicNackAsync(deliveryTag, multiple: false, requeue: requeue).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -253,20 +308,20 @@ public sealed class RabbitMqConsumerBackgroundService<TMessage> : BackgroundServ
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        await base.StopAsync(cancellationToken);
+        await base.StopAsync(cancellationToken).ConfigureAwait(false);
 
         if (_channel is not null)
         {
             try
             {
-                await _channel.CloseAsync(cancellationToken);
+                await _channel.CloseAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
                 _logger.LogDebug(ex, "Error closing consumer channel for {Queue}", _options.Queue);
             }
 
-            await _channel.DisposeAsync();
+            await _channel.DisposeAsync().ConfigureAwait(false);
             _channel = null;
         }
     }

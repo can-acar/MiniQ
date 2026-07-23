@@ -120,6 +120,11 @@ At startup, `RabbitMqTopologyInitializer` (an `IHostedService`) declares every r
 
 - **Publishing** serializes the payload to JSON once, rents a confirmed channel from the pool, and publishes persistently with exponential retry on transient faults.
 - **Consuming** pulls with a bounded prefetch, dispatches each message to a scoped `IMessageHandler<T>`, and acknowledges on success. On failure it forwards the message to a TTL-based retry queue (incrementing an `x-retry-count` header); once `MaxRetries` is exhausted the message is dead-lettered.
+- A consumer whose channel closes and does not auto-recover re-establishes its subscription on a background health check, so it never dies silently.
+
+### Delivery guarantees
+
+MiniQ is **at-least-once**. Retries and the non-atomic *forward-to-retry-then-ack* step can deliver a message more than once, and publisher confirms prove broker receipt — not routing or exactly-once processing. **Make your handlers idempotent.** Set `RabbitMqPublisherOptions.Mandatory = true` if you need unroutable messages surfaced rather than dropped.
 
 ## Building from source
 
