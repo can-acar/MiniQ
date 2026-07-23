@@ -1,5 +1,7 @@
 # MiniQ
 
+**English · [Türkçe](README.tr.md)**
+
 A lightweight, opinionated messaging toolkit built **directly on the native [`RabbitMQ.Client`](https://www.nuget.org/packages/RabbitMQ.Client)** — no MassTransit, no heavy abstraction layer. MiniQ gives you typed publishers and consumers, connection sharing, channel pooling, quorum queues, and automatic retry / dead-letter topology behind a small fluent DI builder.
 
 It is a **thin layer, not a framework**: you keep full access to the underlying `IChannel` semantics, and everything MiniQ declares is plain RabbitMQ topology you can inspect in the management UI.
