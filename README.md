@@ -128,11 +128,20 @@ dotnet build
 dotnet test
 ```
 
-The unit tests cover the DI builder registrations and the channel pool lifecycle; they do **not** require a running broker. To try the end-to-end sample you need RabbitMQ:
+The unit tests cover the DI builder registrations and the channel pool lifecycle; they do **not** require a running broker. To try the samples you need RabbitMQ:
 
 ```bash
 docker run -d --name miniq-rabbit -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+```
+
+Two samples are included:
+
+```bash
+# End-to-end: a producer and a consumer over one queue, with retry + dead-letter topology
 dotnet run --project samples/MiniQ.Sample
+
+# Publisher only: declares the exchange, publishes a few messages, then exits
+dotnet run --project samples/MiniQ.Publisher.Sample
 ```
 
 ## License
